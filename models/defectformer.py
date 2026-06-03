@@ -69,6 +69,12 @@ class DefectFormer(nn.Module):
 
         # 1. Backbone: {F2, F3, F4, F5}
         features = self.backbone(x)
+        # timm Swin outputs NHWC (channels-last); convert to NCHW for Conv2d
+        features = [
+            f.permute(0, 3, 1, 2).contiguous() if f.ndim == 4 and f.shape[-1] != f.shape[1]
+            else f
+            for f in features
+        ]
 
         # 2. MSFE: {P2, P3, P4, P5}
         enhanced = self.msfe(features)
