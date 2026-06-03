@@ -1,0 +1,21 @@
+# ── Mask R-CNN (torchvision, already in main env) ────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+
+# ── SOLOv2 / CondInst / Mask2Former (mmdetection) ────────────────
+# Install order matters:
+#   pip install -U openmim
+#   mim install mmengine
+#   mim install "mmcv>=2.0.0"
+#   mim install mmdet
+
+# The above installs the following automatically; listed for reference:
+# mmengine>=0.10.0
+# mmcv>=2.0.0
+# mmdet>=3.0.0
+
+# ── COCO polygon mask decoding (needed by eval_baselines.py) ──────
+pycocotools>=2.0.6
+
+# ── Polygon extraction in convert_to_coco.py ─────────────────────
+opencv-python>=4.7.0
