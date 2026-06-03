@@ -106,20 +106,18 @@ class DMCA(nn.Module):
         K = reshape(self.k_proj(E_flat), L)
         V = reshape(self.v_proj(E_flat), L)
 
-        attn = torch.matmul(Q, K.transpose(-2, -1)) * self.scale   # [B, nh, Nq, L]
+        attn_raw  = torch.matmul(Q, K.transpose(-2, -1)) * self.scale  # [B, nh, Nq, L]
 
         # Mask: add −∞ to blocked positions  (mask=1 → allow)
-        attn_bias = (1.0 - mask.unsqueeze(1)) * (-1e9)              # [B, 1, Nq, L]
-        attn = attn + attn_bias
+        attn_bias = (1.0 - mask.unsqueeze(1)) * (-1e9)               # [B, 1, Nq, L]
+        attn      = attn_raw + attn_bias
 
-        # Safety: if every position is masked for a query, allow all
-        all_masked = (mask.sum(-1) == 0)                            # [B, Nq]
+        # Safety: if every position is masked for a query, fall back to unmasked attn
+        all_masked = (mask.sum(-1) == 0)                             # [B, Nq]
         if all_masked.any():
-            attn_bias_safe = torch.zeros_like(attn)
-            attn_bias_safe[all_masked.unsqueeze(1).expand_as(attn_bias_safe)] = 0
-            attn[all_masked.unsqueeze(1).unsqueeze(-1).expand_as(attn)] = \
-                (torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-                 )[all_masked.unsqueeze(1).unsqueeze(-1).expand_as(attn)]
+            # [B, 1, Nq, 1] broadcast to [B, nh, Nq, L]
+            fb = all_masked.unsqueeze(1).unsqueeze(-1).expand_as(attn)
+            attn = torch.where(fb, attn_raw, attn)
 
         out = torch.matmul(F.softmax(attn, dim=-1), V)              # [B, nh, Nq, hd]
         out = out.transpose(1, 2).contiguous().view(B, Nq, d)
