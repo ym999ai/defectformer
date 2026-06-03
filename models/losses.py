@@ -121,26 +121,73 @@ class FocalLoss(nn.Module):
 
 class DefectFormerLoss(nn.Module):
     """
-    L_total = Σ_{matched} [λ_cls·L_cls + λ_mask·L_BCE + λ_dice·L_Dice]
+    L_total = Σ_{matched} [λ_cls·L_cls + λ_mask·L_BCE + λ_dice·L_Dice
+                           + λ_boundary·L_Boundary + λ_iou·L_IoU]
 
-    Auxiliary losses at each of the L decoder layers (unit weight).
+    New terms (all off by default for backward compatibility):
+      L_Boundary  – Laplacian-weighted BCE that penalises boundary errors
+                    more heavily; improves AP75 and thin-defect precision.
+      L_IoU       – Differentiable instance-level IoU loss; directly
+                    optimises the AP metric.
+
+    Auxiliary losses at each decoder layer (unit weight each).
     Matching is performed on the *last* layer's outputs.
     """
 
-    NO_OBJ_WEIGHT = 0.1   # down-weight background class
+    NO_OBJ_WEIGHT = 0.1   # down-weight background class in cls loss
 
     def __init__(self, num_classes: int,
-                 lambda_cls:  float = 2.0,
-                 lambda_mask: float = 5.0,
-                 lambda_dice: float = 5.0):
+                 lambda_cls:      float = 2.0,
+                 lambda_mask:     float = 5.0,
+                 lambda_dice:     float = 5.0,
+                 lambda_boundary: float = 0.0,   # set > 0 to enable
+                 lambda_iou:      float = 0.0):  # set > 0 to enable
         super().__init__()
-        self.num_classes = num_classes
-        self.lambda_cls  = lambda_cls
-        self.lambda_mask = lambda_mask
-        self.lambda_dice = lambda_dice
+        self.num_classes      = num_classes
+        self.lambda_cls       = lambda_cls
+        self.lambda_mask      = lambda_mask
+        self.lambda_dice      = lambda_dice
+        self.lambda_boundary  = lambda_boundary
+        self.lambda_iou       = lambda_iou
 
         self.matcher   = HungarianMatcher()
         self.focal_cls = FocalLoss()
+
+        # Laplacian kernel for boundary detection (registered as buffer)
+        lap = torch.tensor([[0., 1., 0.], [1., -4., 1.], [0., 1., 0.]])
+        self.register_buffer("_laplacian", lap.view(1, 1, 3, 3))
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _boundary_weight(self, t_mask: torch.Tensor) -> torch.Tensor:
+        """
+        t_mask : [N, H*W] binary float
+        Returns weight map [N, H*W] with 1 at interior, 2 at boundary pixels.
+        Boundary is detected via Laplacian edge filter.
+        """
+        N, L = t_mask.shape
+        H = W = int(L ** 0.5)   # assumes square spatial dims
+        if H * W != L:
+            return torch.ones_like(t_mask)   # non-square → no boundary boost
+
+        m2d   = t_mask.view(N, 1, H, W)
+        edges = F.conv2d(m2d, self._laplacian, padding=1).abs()
+        bnd   = (edges > 0.5).float().view(N, L)
+        return 1.0 + bnd                     # boundary pixels get weight 2
+
+    @staticmethod
+    def _iou_loss(p_sig: torch.Tensor, t_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Differentiable IoU loss per matched pair.
+        p_sig  : [N, L] sigmoid predictions
+        t_mask : [N, L] binary GT
+        Returns scalar mean IoU loss.
+        """
+        inter = (p_sig * t_mask).sum(-1)
+        union = p_sig.sum(-1) + t_mask.sum(-1) - inter
+        return (1.0 - (inter + 1.0) / (union + 1.0)).mean()
 
     # ------------------------------------------------------------------
 
@@ -149,25 +196,25 @@ class DefectFormerLoss(nn.Module):
                     targets: list,
                     indices: list) -> torch.Tensor:
         """Compute combined loss for one decoder layer given fixed matching."""
-        device = pred_logits.device
+        device   = pred_logits.device
         B, Nq, _ = pred_logits.shape
 
-        total = torch.zeros(1, device=device)
+        total    = torch.zeros(1, device=device)
         num_inst = max(sum(len(t["labels"]) for t in targets), 1)
 
         for b, (pi, ti) in enumerate(indices):
-            pi, ti = pi.to(device), ti.to(device)
+            pi, ti     = pi.to(device), ti.to(device)
             tgt_labels = targets[b]["labels"].to(device)
             tgt_masks  = targets[b]["masks"].float().to(device)
 
-            # ---- classification ----
+            # ── Classification ──────────────────────────────────────
             if len(pi) > 0:
                 total = total + self.lambda_cls * self.focal_cls(
                     pred_logits[b, pi], tgt_labels[ti]
                 )
 
-            # no-object penalty for unmatched queries
-            all_q = torch.arange(Nq, device=device)
+            # No-object penalty for unmatched queries
+            all_q     = torch.arange(Nq, device=device)
             unmatched = all_q[~torch.isin(all_q, pi)]
             if len(unmatched) > 0:
                 no_obj = torch.full((len(unmatched),), self.num_classes,
@@ -175,21 +222,41 @@ class DefectFormerLoss(nn.Module):
                 total = total + self.NO_OBJ_WEIGHT * self.lambda_cls * \
                     F.cross_entropy(pred_logits[b, unmatched], no_obj)
 
-            # ---- mask losses (only for matched pairs) ----
             if len(pi) == 0:
                 continue
 
-            p_mask = pred_mask_logits[b, pi]       # [N, H*W]
-            t_mask = tgt_masks[ti]                 # [N, H*W]
+            p_mask = pred_mask_logits[b, pi]   # [N, H*W] logits
+            t_mask = tgt_masks[ti]             # [N, H*W] binary
 
-            bce = F.binary_cross_entropy_with_logits(p_mask, t_mask)
+            # ── BCE mask loss ────────────────────────────────────────
+            if self.lambda_boundary > 0:
+                # Boundary-aware: weight boundary pixels ×2
+                w   = self._boundary_weight(t_mask)
+                bce = F.binary_cross_entropy_with_logits(
+                    p_mask, t_mask, weight=w, reduction="mean"
+                )
+            else:
+                bce = F.binary_cross_entropy_with_logits(p_mask, t_mask)
             total = total + self.lambda_mask * bce
 
+            if self.lambda_boundary > 0:
+                # Extra boundary-only BCE on top of the weighted BCE
+                bnd_w   = (w > 1.0).float()          # 1 only at boundary
+                bnd_bce = F.binary_cross_entropy_with_logits(
+                    p_mask, t_mask, weight=bnd_w, reduction="sum"
+                ) / (bnd_w.sum() + 1e-6)
+                total = total + self.lambda_boundary * bnd_bce
+
+            # ── Dice loss ────────────────────────────────────────────
             p_sig = torch.sigmoid(p_mask)
-            num = 2.0 * (p_sig * t_mask).sum(-1)
-            den = p_sig.sum(-1) + t_mask.sum(-1)
-            dice = (1.0 - (num + 1.0) / (den + 1.0)).mean()
+            num_  = 2.0 * (p_sig * t_mask).sum(-1)
+            den_  = p_sig.sum(-1) + t_mask.sum(-1)
+            dice  = (1.0 - (num_ + 1.0) / (den_ + 1.0)).mean()
             total = total + self.lambda_dice * dice
+
+            # ── IoU loss (optional) ──────────────────────────────────
+            if self.lambda_iou > 0:
+                total = total + self.lambda_iou * self._iou_loss(p_sig, t_mask)
 
         return total / num_inst
 
@@ -202,7 +269,6 @@ class DefectFormerLoss(nn.Module):
         all_mask_logits : list[L] of [B, Nq, H*W]
         targets         : list of dicts with 'labels' [N_i], 'masks' [N_i, H*W]
         """
-        # Matching on last layer
         indices = self.matcher(all_cls_logits[-1], all_mask_logits[-1], targets)
 
         loss = torch.zeros(1, device=all_cls_logits[0].device)

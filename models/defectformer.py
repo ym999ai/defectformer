@@ -28,6 +28,7 @@ class DefectFormer(nn.Module):
         num_heads: int = 8,
         backbone_name: str = "swin_tiny_patch4_window7_224",
         pretrained: bool = True,
+        use_se: bool = False,
     ):
         super().__init__()
 
@@ -41,7 +42,7 @@ class DefectFormer(nn.Module):
         in_channels = self.backbone.feature_info.channels()  # [96,192,384,768] for Swin-T
 
         # --- MSFE ---
-        self.msfe = MSFE(in_channels=in_channels, d=d)
+        self.msfe = MSFE(in_channels=in_channels, d=d, use_se=use_se)
 
         # --- Pixel Decoder ---
         self.pixel_decoder = PixelDecoder(d=d)
